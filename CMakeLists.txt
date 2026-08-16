@@ -1218,6 +1218,7 @@ add_library(
   src/effects/backends/builtin/builtinbackend.cpp
   src/effects/backends/builtin/distortioneffect.cpp
   src/effects/backends/builtin/echoeffect.cpp
+  src/effects/backends/builtin/echoouteffect.cpp
   src/effects/backends/builtin/filtereffect.cpp
   src/effects/backends/builtin/flangereffect.cpp
   src/effects/backends/builtin/glitcheffect.cpp
