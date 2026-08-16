@@ -170,7 +170,7 @@ void EchoOutEffect::processChannel(
 
     int delay_frames = static_cast<int>(delay_seconds * sample_rate);
     int delay_samples = delay_frames * channels;
-    delay_samples = std::clamp(delay_samples, channels * 64, pState->delay_buf.size());
+    delay_samples = std::clamp(delay_samples, channels * 64, static_cast<int>(pState->delay_buf.size()));
 
     if (pState->prev_delay_samples == 0) {
         pState->prev_delay_samples = delay_samples;
