@@ -115,11 +115,12 @@ void EchoOutEffect::processChannel(
         return;
     }
 
-    // 2. Calculate Size in seconds and beats
+    // 2. Calculate Size and Max Capture in seconds and frames
     double size_seconds = 0.5;
-    double effective_beats = 1.0;
+    double max_capture_seconds = 2.0;
 
     if (groupFeatures.beat_length.has_value()) {
+        double effective_beats = 1.0;
         if (m_pQuantizeParameter->toBool()) {
             // 5 Balanced physical sectors: 1/4, 1/2, 1, 2, 4 beats
             static const double kQuantizedBeats[] = {0.25, 0.50, 1.00, 2.00, 4.00};
@@ -129,15 +130,19 @@ void EchoOutEffect::processChannel(
             effective_beats = 0.25 + size_param * (4.0 - 0.25);
         }
         size_seconds = effective_beats * groupFeatures.beat_length->seconds;
+        max_capture_seconds = 4.0 * groupFeatures.beat_length->seconds;
     } else {
         // Fallback without BPM: 0.10s to 2.50s
         size_seconds = 0.10 + size_param * (2.50 - 0.10);
-        effective_beats = size_seconds;
+        max_capture_seconds = 2.50;
     }
 
     int size_frames = static_cast<int>(size_seconds * sample_rate);
+    int max_capture_frames = static_cast<int>(max_capture_seconds * sample_rate);
     int max_buffer_frames = pState->buffer.size() / channels;
+
     size_frames = std::clamp(size_frames, 64, max_buffer_frames);
+    max_capture_frames = std::clamp(max_capture_frames, size_frames, max_buffer_frames);
 
     // 3. Trigger / Transition from Idle to Recording
     if (pState->phase == EchoOutPhase::Idle) {
@@ -148,11 +153,25 @@ void EchoOutEffect::processChannel(
         pState->prev_decay_param = decay_param;
     }
 
-    // 4. Calculate Dynamic Filter Parameters
-    // Filter sweep varies as gain drops: decay_progress goes 0.0 -> 1.0
+    // 4. Calculate Continuous Frame-by-Frame Decay Multiplier
+    float decay_step_factor = 1.0f;
+    if (decay_param < 0.95) {
+        double decay_beats = 0.25 + (decay_param / 0.95) * (16.0 - 0.25);
+        double total_decay_seconds = 0.0;
+        if (groupFeatures.beat_length.has_value()) {
+            total_decay_seconds = decay_beats * groupFeatures.beat_length->seconds;
+        } else {
+            total_decay_seconds = 0.25 + (decay_param / 0.95) * (10.0 - 0.25);
+        }
+        double total_decay_frames = std::max(64.0, total_decay_seconds * sample_rate);
+        // Multiplier reaching -40 dB (0.01) smoothly at the target decay frame count
+        decay_step_factor = static_cast<float>(std::pow(0.01, 1.0 / total_decay_frames));
+    }
+
+    // 5. Calculate Dynamic Filter Parameters
     float decay_progress = 1.0f - pState->current_gain;
     if (decay_param >= 0.95) {
-        decay_progress = 0.0f; // Static/neutral during infinite freeze
+        decay_progress = 0.0f; // Neutral during freeze
     }
 
     const bool use_filter = (std::abs(filter_param) > 0.02);
@@ -162,10 +181,8 @@ void EchoOutEffect::processChannel(
     if (use_filter) {
         double cutoff_hz = 20000.0;
         if (is_hpf) {
-            // High-Pass: sweeps up into air/treble as the echo dies out
             cutoff_hz = 20.0 + (filter_param * 4000.0 * decay_progress);
         } else {
-            // Low-Pass: sweeps down into dub/bass as the echo dies out
             double target_min_hz = 200.0 + (1.0 + filter_param) * 800.0;
             cutoff_hz = 20000.0 - (20000.0 - target_min_hz) * decay_progress;
         }
@@ -173,65 +190,47 @@ void EchoOutEffect::processChannel(
         alpha = static_cast<float>(1.0 - std::exp(-2.0 * M_PI * cutoff_hz / sample_rate));
     }
 
-    // 5. Audio Loop Processing
+    // 6. Audio Loop Processing
     for (int frame = 0; frame < frames_per_buffer; ++frame) {
         int sample_idx = frame * channels;
 
-        if (pState->phase == EchoOutPhase::Recording) {
-            // Live audio dry output while recording the phrase
+        // Background capture: always record up to max_capture_frames (4 beats)
+        if (pState->recorded_frames < max_capture_frames) {
             for (int ch = 0; ch < channels; ++ch) {
-                pOutput[sample_idx + ch] = pInput[sample_idx + ch];
                 pState->buffer[pState->recorded_frames * channels + ch] = pInput[sample_idx + ch];
             }
             pState->recorded_frames++;
+        }
 
-            // When selected capture size is reached, cut live track and switch to EchoOut loop
+        if (pState->phase == EchoOutPhase::Recording) {
+            // Live audio dry output while initial loop size is being captured
+            for (int ch = 0; ch < channels; ++ch) {
+                pOutput[sample_idx + ch] = pInput[sample_idx + ch];
+            }
+
+            // Switch to EchoOut once the requested size is recorded
             if (pState->recorded_frames >= size_frames) {
-                // Micro-crossfade seam smoothing at buffer boundary to guarantee zero click
-                const int kCrossfadeFrames = std::min(64, size_frames / 4);
-                for (int f = 0; f < kCrossfadeFrames; ++f) {
-                    float head_gain = static_cast<float>(f) / static_cast<float>(kCrossfadeFrames);
-                    float tail_gain = 1.0f - head_gain;
-                    int tail_sample = (size_frames - kCrossfadeFrames + f) * channels;
-                    int head_sample = f * channels;
-                    for (int ch = 0; ch < channels; ++ch) {
-                        pState->buffer[tail_sample + ch] =
-                                pState->buffer[tail_sample + ch] * tail_gain +
-                                pState->buffer[head_sample + ch] * head_gain;
-                    }
-                }
-
                 pState->phase = EchoOutPhase::EchoOut;
                 pState->loop_read_pos = 0;
             }
         } else if (pState->phase == EchoOutPhase::EchoOut) {
-            // Decay update at the boundary of each loop cycle
-            if (pState->loop_read_pos == 0) {
-                if (decay_param >= 0.95) {
-                    // Infinite looper mode: hold full gain
-                    pState->current_gain = 1.0f;
-                } else {
-                    // Option 2: Acoustic / logarithmic musical decay
-                    double decay_beats = 0.25 + (decay_param / 0.95) * (16.0 - 0.25);
-                    double total_loops = std::max(1.0, decay_beats / effective_beats);
-
-                    // Drop by factor reaching -40dB (0.01) at the target loop count
-                    float decay_factor = std::pow(0.01f, 1.0f / static_cast<float>(total_loops));
-                    pState->current_gain *= decay_factor;
-
-                    if (pState->current_gain < 0.005f) {
-                        pState->current_gain = 0.0f; // Clean, complete silence
-                    }
-                }
+            // Continuous frame-by-frame decay (holds current level if in Freeze)
+            pState->current_gain *= decay_step_factor;
+            if (pState->current_gain < 0.005f) {
+                pState->current_gain = 0.0f; // Clean silence
             }
 
             if (pState->current_gain <= 0.0f) {
-                // Decay finished: full silence (live deck stays cleanly muted)
+                // Decay finished: live deck stays cut
                 for (int ch = 0; ch < channels; ++ch) {
                     pOutput[sample_idx + ch] = 0.0f;
                 }
             } else {
-                int read_buf_idx = (pState->loop_read_pos % size_frames) * channels;
+                // Dynamically wrap around current size_frames (bounded by recorded memory)
+                int active_loop_frames = std::min(size_frames, pState->recorded_frames);
+                active_loop_frames = std::max(64, active_loop_frames);
+
+                int read_buf_idx = (pState->loop_read_pos % active_loop_frames) * channels;
                 CSAMPLE raw_l = pState->buffer[read_buf_idx] * pState->current_gain;
                 CSAMPLE raw_r = pState->buffer[read_buf_idx + (channels > 1 ? 1 : 0)] * pState->current_gain;
 
@@ -250,7 +249,6 @@ void EchoOutEffect::processChannel(
                         filtered_r = pState->filter_lp_r;
                     }
                 } else {
-                    // Keep filter state updated to avoid pops when turned on
                     pState->filter_lp_l = raw_l;
                     pState->filter_lp_r = raw_r;
                 }
@@ -260,7 +258,7 @@ void EchoOutEffect::processChannel(
                     pOutput[sample_idx + 1] = SampleUtil::clampSample(filtered_r);
                 }
 
-                pState->loop_read_pos = (pState->loop_read_pos + 1) % size_frames;
+                pState->loop_read_pos = (pState->loop_read_pos + 1) % active_loop_frames;
             }
         }
     }
