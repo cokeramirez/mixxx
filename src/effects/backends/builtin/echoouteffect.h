@@ -2,15 +2,22 @@
 
 #include <QMap>
 #include <algorithm>
+#include <cmath>
 
 #include "effects/backends/effectprocessor.h"
 #include "engine/engine.h"
 #include "util/class.h"
 #include "util/samplebuffer.h"
 
+enum class EchoOutPhase {
+    Idle,
+    Recording,
+    EchoOut
+};
+
 class EchoOutGroupState : public EffectState {
   public:
-    // 8 seconds max. Supports 4 beats down to 30 BPM.
+    // 8 seconds supports 4 beats down to 30 BPM.
     static constexpr int kMaxDelaySeconds = 8;
 
     EchoOutGroupState(const mixxx::EngineParameters& engineParameters)
@@ -21,33 +28,32 @@ class EchoOutGroupState : public EffectState {
     ~EchoOutGroupState() override = default;
 
     void audioParametersChanged(const mixxx::EngineParameters& engineParameters) {
-        delay_buf = mixxx::SampleBuffer(kMaxDelaySeconds *
+        buffer = mixxx::SampleBuffer(kMaxDelaySeconds *
                 engineParameters.sampleRate() *
                 engineParameters.channelCount());
     }
 
     void clear() {
-        delay_buf.clear();
-        prev_send = 1.0f;
-        prev_dry = 1.0f;
-        prev_feedback = 0.0f;
-        prev_delay_samples = 0;
-        write_position = 0;
-        active = false;
+        buffer.clear();
+        phase = EchoOutPhase::Idle;
+        recorded_frames = 0;
+        loop_read_pos = 0;
+        current_gain = 0.0f;
+        prev_decay_param = 0.0f;
 
-        // Filter state memory
+        // Filter state memory (stereo)
         filter_lp_l = 0.0f;
         filter_lp_r = 0.0f;
     }
 
-    mixxx::SampleBuffer delay_buf;
-    CSAMPLE_GAIN prev_send;
-    CSAMPLE_GAIN prev_dry;
-    CSAMPLE_GAIN prev_feedback;
-    int prev_delay_samples;
-    int write_position;
-    bool active;
+    mixxx::SampleBuffer buffer;
+    EchoOutPhase phase;
+    int recorded_frames;
+    int loop_read_pos;
+    CSAMPLE_GAIN current_gain;
+    double prev_decay_param;
 
+    // Filter memory
     CSAMPLE filter_lp_l;
     CSAMPLE filter_lp_r;
 };
@@ -76,7 +82,7 @@ class EchoOutEffect : public EffectProcessorImpl<EchoOutGroupState> {
         return getId();
     }
 
-    EngineEffectParameterPointer m_pFeedbackParameter;
+    EngineEffectParameterPointer m_pDecayParameter;
     EngineEffectParameterPointer m_pSizeParameter;
     EngineEffectParameterPointer m_pFilterParameter;
     EngineEffectParameterPointer m_pQuantizeParameter;
