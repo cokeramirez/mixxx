@@ -93,6 +93,7 @@ EngineBuffer::EngineBuffer(const QString& group,
           m_iSeekPhaseQueued(0),
           m_iEnableSyncQueued(SYNC_REQUEST_NONE),
           m_iSyncModeQueued(static_cast<int>(SyncMode::Invalid)),
+          m_slipQuitAndAdopt(0),
           m_bPlayAfterLoading(false),
           m_channelCount(mixxx::kEngineChannelOutputCount),
           m_pCrossfadeBuffer(SampleUtil::alloc(
@@ -266,7 +267,8 @@ EngineBuffer::EngineBuffer(const QString& group,
             Qt::DirectConnection);
 
     m_pReadAheadManager = new ReadAheadManager(m_pReader,
-                                               m_pLoopingControl);
+            m_pLoopingControl,
+            m_pCueControl);
     m_pReadAheadManager->addRateControl(m_pRateControl);
 
     m_pKeylockEngine = new ControlProxy(kAppGroup, QStringLiteral("keylock_engine"), this);
@@ -756,10 +758,9 @@ void EngineBuffer::doSeekFractional(double fractionalPos, enum SeekRequest seekT
     VERIFY_OR_DEBUG_ASSERT(!util_isnan(fractionalPos)) {
         return;
     }
-
-    // FIXME: Use maybe invalid here
     const mixxx::audio::FramePos trackEndPosition = getTrackEndPosition();
-    VERIFY_OR_DEBUG_ASSERT(trackEndPosition.isValid()) {
+    if (!trackEndPosition.isValid()) {
+        // happens if no track is loaded
         return;
     }
     const auto seekPosition = trackEndPosition * fractionalPos;
@@ -871,11 +872,18 @@ void EngineBuffer::slotKeylockEngineChanged(double dIndex) {
 #ifdef __RUBBERBAND__
     case KeylockEngine::RubberBandFaster:
         m_pScaleRB->useEngineFiner(false);
+        m_pScaleRB->useOptionWindowShort(false);
         m_pScaleKeylock = m_pScaleRB;
         break;
     case KeylockEngine::RubberBandFiner:
         m_pScaleRB->useEngineFiner(
                 true); // in case of Rubberband V2 it falls back to RUBBERBAND_FASTER
+        m_pScaleRB->useOptionWindowShort(false);
+        m_pScaleKeylock = m_pScaleRB;
+        break;
+    case KeylockEngine::RubberBandR3ShortWindow:
+        m_pScaleRB->useEngineFiner(true);
+        m_pScaleRB->useOptionWindowShort(true);
         m_pScaleKeylock = m_pScaleRB;
         break;
 #endif
@@ -883,6 +891,11 @@ void EngineBuffer::slotKeylockEngineChanged(double dIndex) {
         slotKeylockEngineChanged(static_cast<double>(defaultKeylockEngine()));
         break;
     }
+}
+
+void EngineBuffer::slipQuitAndAdopt() {
+    m_slipQuitAndAdopt.storeRelease(1);
+    m_pSlipButton->set(0);
 }
 
 void EngineBuffer::processTrackLocked(
@@ -1227,8 +1240,7 @@ void EngineBuffer::process(CSAMPLE* pOutput, const std::size_t bufferSize) {
     m_pScaleRB->setSignal(m_sampleRate, m_channelCount);
 #endif
 
-    bool hasStableTrack = m_pTrackLoaded->toBool() && m_iTrackLoading.loadAcquire() == 0;
-    if (hasStableTrack && m_pause.tryLock()) {
+    if (isTrackLoaded() && m_pause.tryLock()) {
         processTrackLocked(pOutput, bufferSize, m_sampleRate);
         // release the pauselock
         m_pause.unlock();
@@ -1278,8 +1290,12 @@ void EngineBuffer::processSlip(std::size_t bufferSize) {
             m_slipPos = m_playPos;
             m_dSlipRate = m_rate_old;
         } else {
-            // TODO(owen) assuming that looping will get canceled properly
-            seekExact(m_slipPos.toNearestFrameBoundary());
+            // If m_slipQuitAndAdopt is 1 we've already quit slip mode
+            // but we don't seek in that case.
+            if (m_slipQuitAndAdopt.fetchAndStoreAcquire(0) == 0) {
+                // TODO(owen) assuming that looping will get canceled properly
+                seekExact(m_slipPos.toNearestFrameBoundary());
+            }
             m_slipPos = mixxx::audio::kStartFramePos;
         }
     }
@@ -1603,10 +1619,7 @@ void EngineBuffer::addControl(EngineControl* pControl) {
 }
 
 bool EngineBuffer::isTrackLoaded() const {
-    if (m_pCurrentTrack) {
-        return true;
-    }
-    return false;
+    return (m_pCurrentTrack && m_iTrackLoading.loadAcquire() == 0);
 }
 
 TrackPointer EngineBuffer::getLoadedTrack() const {

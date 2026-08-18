@@ -1,5 +1,6 @@
 #include "waveform/waveformwidgetfactory.h"
 
+#include "waveform/renderers/waveformrendererabstract.h"
 #include "waveform/waveform.h"
 
 #ifdef MIXXX_USE_QOPENGL
@@ -10,6 +11,9 @@
 #include <QGLFormat>
 #include <QGLShaderProgram>
 #endif
+#ifdef Q_OS_ANDROID
+#include <GLES3/gl3.h>
+#endif
 
 #include <QOpenGLFunctions>
 #include <QRegularExpression>
@@ -17,6 +21,7 @@
 #include <QWidget>
 #include <QWindow>
 
+#include "control/controlobject.h"
 #include "moc_waveformwidgetfactory.cpp"
 #include "util/cmdlineargs.h"
 #include "util/math.h"
@@ -133,6 +138,7 @@ WaveformWidgetFactory::WaveformWidgetFactory()
           m_untilMarkAlign(Qt::AlignVCenter),
           m_untilMarkTextPointSize(24),
           m_untilMarkTextHeightLimit(toUntilMarkTextHeightLimit(0)),
+          m_stemSplitTracks(false),
           m_openGlAvailable(false),
           m_openGlesAvailable(false),
           m_openGLShaderAvailable(false),
@@ -143,6 +149,8 @@ WaveformWidgetFactory::WaveformWidgetFactory()
           m_frameCnt(0),
           m_actualFrameRate(0),
           m_playMarkerPosition(WaveformWidgetRenderer::s_defaultPlayMarkerPosition) {
+    m_pStemSplitTracksControl = std::make_unique<ControlObject>(
+            ConfigKey(kWaveformGroup, QStringLiteral("stem_split_tracks")));
     m_visualGain[AllBand] = kVisualGainDefault[AllBand];
     m_visualGain[Low] = kVisualGainDefault[Low];
     m_visualGain[Mid] = kVisualGainDefault[Mid];
@@ -471,6 +479,9 @@ bool WaveformWidgetFactory::setConfig(UserSettingsPointer config) {
     setStemOutlineOpacity(static_cast<float>(
             m_config->getValue(ConfigKey(kWaveformGroup, QStringLiteral("stem_outline_opacity")),
                     0.15)));
+    setStemSplitTracks(m_config->getValue(
+            ConfigKey(kWaveformGroup, QStringLiteral("stem_split_tracks")),
+            false));
 
     return true;
 }
@@ -559,7 +570,7 @@ bool WaveformWidgetFactory::setWaveformWidget(WWaveformViewer* viewer,
 }
 
 void WaveformWidgetFactory::setFrameRate(int frameRate) {
-    m_frameRate = math_clamp(frameRate, 1, 120);
+    m_frameRate = math_clamp(frameRate, 1, 240);
     if (m_config) {
         m_config->setValue(kFrameRateKey, m_frameRate);
     }
@@ -1017,7 +1028,7 @@ void WaveformWidgetFactory::evaluateWidgets() {
     m_waveformWidgetHandles.clear();
     QHash<WaveformWidgetType::Type, QList<WaveformWidgetBackend>> collectedHandles;
     QHash<WaveformWidgetType::Type,
-            allshader::WaveformRendererSignalBase::Options>
+            WaveformRendererSignalBase::Options>
             supportedOptions;
     bool useGles = isOpenGlesAvailable(); // we can make use of GLES waveforms
     for (WaveformWidgetType::Type type : WaveformWidgetType::kValues) {
@@ -1093,81 +1104,83 @@ void WaveformWidgetFactory::evaluateWidgets() {
         m_waveformWidgetHandles.push_back(WaveformWidgetAbstractHandle(type, backends
 #ifdef MIXXX_USE_QOPENGL
                 ,
-                supportedOptions.value(type, allshader::WaveformRendererSignalBase::Option::None)
+                supportedOptions.value(type, WaveformRendererSignalBase::Option::None)
 #endif
                         ));
     }
 }
 
 WaveformWidgetAbstract* WaveformWidgetFactory::createAllshaderWaveformWidget(
-        WaveformWidgetType::Type type, WWaveformViewer* viewer) {
-    allshader::WaveformRendererSignalBase::Options options =
-            m_config->getValue(ConfigKey("[Waveform]", "waveform_options"),
-                    allshader::WaveformRendererSignalBase::Option::None);
+        WaveformWidgetType::Type type,
+        WWaveformViewer* viewer,
+        WaveformRendererSignalBase::Options options) {
     return new allshader::WaveformWidget(viewer, type, viewer->getGroup(), options);
 }
 
 WaveformWidgetAbstract* WaveformWidgetFactory::createFilteredWaveformWidget(
-        WWaveformViewer* viewer) {
+        WWaveformViewer* viewer, WaveformRendererSignalBase::Options options) {
     WaveformWidgetBackend backend = getBackendFromConfig();
 
     switch (backend) {
 #ifdef MIXXX_USE_QOPENGL
     case WaveformWidgetBackend::AllShader: {
-        return createAllshaderWaveformWidget(WaveformWidgetType::Type::Filtered, viewer);
+        return createAllshaderWaveformWidget(WaveformWidgetType::Type::Filtered, viewer, options);
     }
 #endif
     default:
-        return new SoftwareWaveformWidget(viewer->getGroup(), viewer);
+        return new SoftwareWaveformWidget(viewer->getGroup(), viewer, options);
     }
 }
 
-WaveformWidgetAbstract* WaveformWidgetFactory::createHSVWaveformWidget(WWaveformViewer* viewer) {
+WaveformWidgetAbstract* WaveformWidgetFactory::createHSVWaveformWidget(
+        WWaveformViewer* viewer, WaveformRendererSignalBase::Options options) {
     WaveformWidgetBackend backend = getBackendFromConfig();
 
     switch (backend) {
 #ifdef MIXXX_USE_QOPENGL
     case WaveformWidgetBackend::AllShader:
-        return createAllshaderWaveformWidget(WaveformWidgetType::HSV, viewer);
+        return createAllshaderWaveformWidget(WaveformWidgetType::HSV, viewer, options);
 #endif
     default:
-        return new HSVWaveformWidget(viewer->getGroup(), viewer);
+        return new HSVWaveformWidget(viewer->getGroup(), viewer, options);
     }
 }
 
-WaveformWidgetAbstract* WaveformWidgetFactory::createRGBWaveformWidget(WWaveformViewer* viewer) {
+WaveformWidgetAbstract* WaveformWidgetFactory::createRGBWaveformWidget(
+        WWaveformViewer* viewer, WaveformRendererSignalBase::Options options) {
     WaveformWidgetBackend backend = getBackendFromConfig();
 
     switch (backend) {
 #ifdef MIXXX_USE_QOPENGL
     case WaveformWidgetBackend::AllShader:
-        return createAllshaderWaveformWidget(WaveformWidgetType::Type::RGB, viewer);
+        return createAllshaderWaveformWidget(WaveformWidgetType::Type::RGB, viewer, options);
 #endif
     default:
-        return new RGBWaveformWidget(viewer->getGroup(), viewer);
+        return new RGBWaveformWidget(viewer->getGroup(), viewer, options);
     }
 }
 
 WaveformWidgetAbstract* WaveformWidgetFactory::createStackedWaveformWidget(
-        WWaveformViewer* viewer) {
+        WWaveformViewer* viewer, WaveformRendererSignalBase::Options options) {
 #ifdef MIXXX_USE_QOPENGL
     WaveformWidgetBackend backend = getBackendFromConfig();
     switch (backend) {
     case WaveformWidgetBackend::AllShader:
-        return createAllshaderWaveformWidget(WaveformWidgetType::Type::Stacked, viewer);
+        return createAllshaderWaveformWidget(WaveformWidgetType::Type::Stacked, viewer, options);
 #endif
     default:
         return new EmptyWaveformWidget(viewer->getGroup(), viewer);
     }
 }
 
-WaveformWidgetAbstract* WaveformWidgetFactory::createSimpleWaveformWidget(WWaveformViewer* viewer) {
+WaveformWidgetAbstract* WaveformWidgetFactory::createSimpleWaveformWidget(
+        WWaveformViewer* viewer, WaveformRendererSignalBase::Options options) {
     WaveformWidgetBackend backend = getBackendFromConfig();
 
     switch (backend) {
 #ifdef MIXXX_USE_QOPENGL
     case WaveformWidgetBackend::AllShader:
-        return createAllshaderWaveformWidget(WaveformWidgetType::Type::Simple, viewer);
+        return createAllshaderWaveformWidget(WaveformWidgetType::Type::Simple, viewer, options);
 #endif
     default:
         return new SimpleSignalWaveformWidget(viewer->getGroup(), viewer);
@@ -1175,11 +1188,11 @@ WaveformWidgetAbstract* WaveformWidgetFactory::createSimpleWaveformWidget(WWavef
 }
 
 WaveformWidgetAbstract* WaveformWidgetFactory::createVSyncTestWaveformWidget(
-        WWaveformViewer* viewer) {
+        WWaveformViewer* pViewer) {
 #ifdef MIXXX_USE_QOPENGL
-    return new GLVSyncTestWidget(viewer->getGroup(), viewer);
+    return new GLVSyncTestWidget(pViewer->getGroup(), pViewer);
 #else
-    return new EmptyWaveformWidget(viewer->getGroup(), viewer);
+    return new EmptyWaveformWidget(pViewer->getGroup(), pViewer);
 #endif
 }
 
@@ -1191,24 +1204,28 @@ WaveformWidgetAbstract* WaveformWidgetFactory::createWaveformWidget(
             type = WaveformWidgetType::Empty;
         }
 
+        WaveformRendererSignalBase::Options options =
+                m_config->getValue(ConfigKey("[Waveform]", "waveform_options"),
+                        WaveformRendererSignalBase::Option::None);
+
         switch (type) {
         case WaveformWidgetType::Simple:
-            pWidget = createSimpleWaveformWidget(pViewer);
+            pWidget = createSimpleWaveformWidget(pViewer, options);
             break;
         case WaveformWidgetType::Filtered:
-            pWidget = createFilteredWaveformWidget(pViewer);
+            pWidget = createFilteredWaveformWidget(pViewer, options);
             break;
         case WaveformWidgetType::HSV:
-            pWidget = createHSVWaveformWidget(pViewer);
+            pWidget = createHSVWaveformWidget(pViewer, options);
             break;
         case WaveformWidgetType::VSyncTest:
             pWidget = createVSyncTestWaveformWidget(pViewer);
             break;
         case WaveformWidgetType::RGB:
-            pWidget = createRGBWaveformWidget(pViewer);
+            pWidget = createRGBWaveformWidget(pViewer, options);
             break;
         case WaveformWidgetType::Stacked:
-            pWidget = createStackedWaveformWidget(pViewer);
+            pWidget = createStackedWaveformWidget(pViewer, options);
             break;
         default:
             pWidget = new EmptyWaveformWidget(pViewer->getGroup(), pViewer);
@@ -1498,6 +1515,16 @@ void WaveformWidgetFactory::setStemOpacity(float value) {
                 static_cast<double>(value));
     }
     emit stemOpacityChanged(value);
+}
+
+void WaveformWidgetFactory::setStemSplitTracks(bool value) {
+    m_stemSplitTracks = value;
+    if (m_config) {
+        m_config->setValue(ConfigKey(kWaveformGroup, QStringLiteral("stem_split_tracks")),
+                value);
+    }
+    m_pStemSplitTracksControl->set(value ? 1.0 : 0.0);
+    emit stemSplitTracksChanged(value);
 }
 
 // static
